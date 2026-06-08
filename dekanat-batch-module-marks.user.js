@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dekanat batch module marks
 // @namespace    local.dekanat.batch-module-marks
-// @version      1.2
+// @version      1.4
 // @description  Select groups, semesters, subjects, then fill 1M/2M component marks.
 // @match        *://*/*
 // @run-at       document-idle
@@ -223,7 +223,7 @@
     return uniqueBy(
       [...root.querySelectorAll('a[href*="/Dekanat/Open?"], a[href*="/dekanat/open?"]')]
         .map(a => subjectFromAnchor(a, group))
-        .filter(subject => subject.params.idDis && subject.params.idGroup && String(subject.params.rules) === '15'),
+        .filter(subject => subject.params.idDis && subject.params.idGroup),
       subjectUniqueKey
     );
   }
@@ -235,7 +235,7 @@
         .forEach(a => subjects.push(subjectFromAnchor(a, group)));
     });
     return uniqueBy(
-      subjects.filter(subject => subject.params.idDis && subject.params.idGroup && String(subject.params.rules) === '15'),
+      subjects.filter(subject => subject.params.idDis && subject.params.idGroup),
       subjectUniqueKey
     );
   }
@@ -397,17 +397,26 @@
   }
 
   async function scanSubjectsForGroup(group){
-    let frameError = null;
+    // Быстрый путь: DataTables разбивает строки на страницы уже в браузере, а сервер
+    // в обычном HTML отдает сразу ВСЕ строки всех семестров. Поэтому один fetch без
+    // iframe возвращает полный список дисциплин за ~0.3с вместо 12-20с на iframe.
     try{
-      const subjects = await scanSubjectsViaFrame(group);
-      if(subjects.length) return subjects;
+      const html = await fetchText(group.href);
+      if(/\/Dekanat\/Open\?|\/dekanat\/open\?/i.test(html)){
+        return parseSubjectsFromHtml(html, group);
+      }
+      log(group.name + ': в HTML нет строк дисциплин, пробую DataTables-iframe', '#c60');
     }catch(e){
-      frameError = e;
+      log(group.name + ': HTML-скан не прошел, пробую DataTables-iframe (' + e.message + ')', '#c60');
     }
 
-    if(frameError) log(group.name + ': DataTables-скан не прошел, пробую HTML (' + frameError.message + ')', '#c60');
-    const html = await fetchText(group.href);
-    return parseSubjectsFromHtml(html, group);
+    // Резерв: на случай серверной (ajax) пагинации DataTables, когда HTML приходит пустым.
+    try{
+      return await scanSubjectsViaFrame(group);
+    }catch(e){
+      log(group.name + ': DataTables-iframe не прошел (' + e.message + ')', '#c33');
+      return [];
+    }
   }
 
   function syncSemestersAfterScan(){
@@ -441,12 +450,12 @@
           state.subjectsByGroup[group.groupId] = subjects;
           syncSemestersAfterScan();
           saveState();
-          log(group.name + ': дисциплин rules=15 найдено ' + subjects.length + ', семестры: ' + availableSemesters().join(', '), subjects.length ? '#06c' : '#c60');
+          log(group.name + ': дисциплин найдено ' + subjects.length + ', семестры: ' + availableSemesters().join(', '), subjects.length ? '#06c' : '#c60');
         }catch(e){
           log(group.name + ': ' + e.message, '#c33');
         }
         renderSubjects();
-        await sleep(250);
+        await sleep(100);
       }
       log('Скан дисциплин завершен. Теперь отметьте семестр и предметы.', '#06c');
     }finally{
@@ -807,7 +816,7 @@
         <label style="display:block;margin:3px 0;padding-bottom:3px;border-bottom:1px solid #e4e4e4">
           <input type="checkbox" data-subject-key="${escapeHtml(item.key)}" ${chosen.has(item.key) ? 'checked' : ''}>
           <span>${escapeHtml(item.sem)} сем | ${escapeHtml(item.name)}</span>
-          <span style="color:#777">#${escapeHtml(item.idDis)} | групп: ${item.groups.length}</span>
+          <span style="color:#777">#${escapeHtml(item.idDis)} | ${escapeHtml((item.ruleText && item.ruleText !== '---') ? item.ruleText : ('rules=' + item.rules))} | групп: ${item.groups.length}</span>
         </label>`).join('')
       : (
         groups.length
@@ -976,7 +985,7 @@
           <div id="dbmf-groups" style="height:230px;overflow:auto;background:#f7f7f7;border:1px solid #ddd;border-radius:5px;padding:8px"></div>
         </div>
         <div>
-          <div style="font-weight:bold;margin-bottom:4px">Семестр и предметы rules=15</div>
+          <div style="font-weight:bold;margin-bottom:4px">Семестр и предметы</div>
           <div id="dbmf-semesters" style="min-height:30px;background:#f7f7f7;border:1px solid #ddd;border-radius:5px;padding:7px;margin-bottom:6px"></div>
           <div style="display:flex;gap:6px;margin-bottom:6px">
             <button id="dbmf-select-sems" style="flex:1;padding:6px;background:#36c;color:#fff;border:0;border-radius:5px;cursor:pointer">Все семестры</button>
