@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dekanat route scanner
 // @namespace    local.dekanat.route-scanner
-// @version      1.1
+// @version      1.2
 // @description  Records clicks, form changes, navigation, and network requests to map Dekanat group/subject workflows.
 // @match        *://*/*
 // @run-at       document-start
@@ -16,6 +16,7 @@
   const PANEL_ID = 'drs-panel';
   const MAX_LOGS = 1200;
   const MAX_TEXT = 1800;
+  const NOISY_URL = /notificationHub|UserProfilePhoto|NotificationCount|InstructionView|GetTeahersAndStudent/i;
 
   let panel, logEl, statusEl, toggleEl;
 
@@ -70,6 +71,105 @@
     }catch(e){
       return short(String(data));
     }
+  }
+
+  function absUrl(url){
+    try{ return new URL(url, location.origin).href; }
+    catch(e){ return String(url || ''); }
+  }
+
+  function paramsOf(url){
+    try{
+      const params = {};
+      new URL(url, location.origin).searchParams.forEach((value, key) => {
+        params[key] = value;
+      });
+      return params;
+    }catch(e){
+      return {};
+    }
+  }
+
+  function uniqueBy(items, keyFn){
+    const seen = new Set();
+    const out = [];
+    items.forEach(item => {
+      const key = keyFn(item);
+      if(seen.has(key)) return;
+      seen.add(key);
+      out.push(item);
+    });
+    return out;
+  }
+
+  function routeSummary(){
+    const path = location.pathname.toLowerCase();
+    const summary = {
+      path: location.pathname,
+      url: location.href,
+      params: paramsOf(location.href)
+    };
+
+    const groupLinks = uniqueBy(
+      [...document.querySelectorAll('a[href*="GroupJurnal?idGroup="], a[href*="groupjurnal?idGroup="]')]
+        .map(a => ({
+          groupId: paramsOf(a.getAttribute('href')).idGroup || '',
+          name: short(a.textContent, 120),
+          href: absUrl(a.getAttribute('href'))
+        }))
+        .filter(x => x.groupId),
+      x => x.groupId
+    );
+
+    const disciplineLinks = uniqueBy(
+      [...document.querySelectorAll('a[href*="/Dekanat/Open?"], a[href*="/dekanat/open?"]')]
+        .map(a => {
+          const href = absUrl(a.getAttribute('href'));
+          return {
+            name: short(a.textContent, 180),
+            href,
+            params: paramsOf(href)
+          };
+        })
+        .filter(x => x.params.idDis && x.params.idGroup),
+      x => x.href
+    );
+
+    if(path.includes('/dekanat/groups')){
+      summary.type = 'groups';
+      summary.faculty = document.querySelector('#faculty')?.value || '';
+      summary.educForm = document.querySelector('#educForm')?.value || '';
+      summary.groupsOnPage = groupLinks;
+      summary.pagination = [...document.querySelectorAll('#dataTables_paginate a')]
+        .map(a => short(a.textContent, 20))
+        .filter(Boolean);
+    }else if(path.includes('/dekanat/groupjurnal')){
+      summary.type = 'group-disciplines';
+      summary.groupId = paramsOf(location.href).idGroup || '';
+      summary.disciplines = disciplineLinks;
+      summary.rules = uniqueBy(
+        [...document.querySelectorAll('select[name="item.rules"], select#item_rules')]
+          .map(s => ({
+            value: s.value,
+            text: selectedOptionText(s)
+          }))
+          .filter(x => x.value),
+        x => `${x.value}|${x.text}`
+      );
+    }else if(path.includes('/dekanat/open')){
+      summary.type = 'open-journal';
+      summary.open = paramsOf(location.href);
+      summary.backToGroup = groupLinks[0] || null;
+      const grid = document.querySelector('#gridContainer .dx-datagrid');
+      summary.hasGrid = Boolean(grid);
+      summary.columns = [...document.querySelectorAll('#gridContainer [role="columnheader"]')]
+        .map(th => short(th.textContent, 80))
+        .filter(Boolean);
+    }else{
+      return null;
+    }
+
+    return summary;
   }
 
   function elementLabel(el){
@@ -137,6 +237,14 @@
       .map(a => ({ text: short(a.textContent, 160), href: a.href }));
 
     pushLog('snapshot', 'page state', { title: document.title, inputs, gridInfo, links });
+    const route = routeSummary();
+    if(route) pushLog('route', route.type, route);
+  }
+
+  function logRouteOnly(){
+    const route = routeSummary();
+    if(route) pushLog('route', route.type, route);
+    else pushLog('route', 'not a Dekanat route page', location.href);
   }
 
   function patchFetch(){
@@ -145,6 +253,7 @@
     const wrappedFetch = function(input, init){
       const url = typeof input === 'string' ? input : (input && input.url) || '';
       const method = (init && init.method) || 'GET';
+      if(NOISY_URL.test(url)) return originalFetch.apply(this, arguments);
       pushLog('fetch->', `${method} ${url}`, dataPreview(init && init.body));
       return originalFetch.apply(this, arguments).then(res => {
         pushLog('fetch<-', `${res.status} ${url}`);
@@ -168,6 +277,7 @@
     window.XMLHttpRequest.prototype.send = function(body){
       const method = this._drsMethod || 'GET';
       const url = this._drsUrl || '';
+      if(NOISY_URL.test(url)) return originalSend.apply(this, arguments);
       pushLog('xhr->', `${method} ${url}`, dataPreview(body));
       this.addEventListener('loadend', () => {
         pushLog('xhr<-', `${this.status} ${url}`, short(this.responseText, 900));
@@ -186,6 +296,11 @@
         : { ...(urlOrOptions || {}) };
       const method = opts.type || opts.method || 'GET';
       const url = opts.url || '';
+      if(NOISY_URL.test(url)) {
+        return typeof urlOrOptions === 'string'
+          ? originalAjax.call(this, opts.url, opts)
+          : originalAjax.call(this, opts);
+      }
       pushLog('ajax->', `${method} ${url}`, dataPreview(opts.data));
 
       const originalSuccess = opts.success;
@@ -335,6 +450,7 @@
       <div style="display:flex;gap:6px;margin-bottom:6px">
         <button id="drs-toggle" style="flex:1;padding:6px;background:#c60;color:#fff;border:0;border-radius:5px;cursor:pointer">Скан: ON</button>
         <button id="drs-snapshot" style="flex:1;padding:6px;background:#36c;color:#fff;border:0;border-radius:5px;cursor:pointer">Снимок</button>
+        <button id="drs-route" style="flex:1;padding:6px;background:#36c;color:#fff;border:0;border-radius:5px;cursor:pointer">Маршрут</button>
         <button id="drs-copy" style="flex:1;padding:6px;background:#555;color:#fff;border:0;border-radius:5px;cursor:pointer">Копия</button>
         <button id="drs-clear" style="flex:1;padding:6px;background:#c33;color:#fff;border:0;border-radius:5px;cursor:pointer">Очистить</button>
       </div>
@@ -349,6 +465,7 @@
     toggleEl = panel.querySelector('#drs-toggle');
     toggleEl.onclick = toggle;
     panel.querySelector('#drs-snapshot').onclick = snapshotPage;
+    panel.querySelector('#drs-route').onclick = logRouteOnly;
     panel.querySelector('#drs-copy').onclick = copyLogs;
     panel.querySelector('#drs-clear').onclick = clearLogs;
     panel.querySelector('#drs-close').onclick = () => panel.remove();
