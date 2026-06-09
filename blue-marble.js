@@ -77,6 +77,8 @@
     colorKey: "bmAutoPainterColor",
     accountsKey: "bmAutoPainterAccounts",
     allowReloadKey: "bmAutoPainterAllowReload",
+    waitFullChargesKey: "bmAutoPainterWaitFullCharges",
+    activeKey: "bmAutoPainterActive",
     positionKey: "bmAutoPainterPos",
     recentCorrectSkipMs: 90000
   };
@@ -192,11 +194,20 @@
     return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 1;
   }
 
+  function readWaitFullCharges() {
+    const input = document.getElementById("bm-auto-waitfull");
+    if (input) return Boolean(input.checked);
+    const saved = getPersistedValue(BM_AUTO.waitFullChargesKey);
+    return saved === null ? true : saved !== "0";
+  }
+
   function formatDuration(seconds) {
     seconds = Math.max(0, Math.round(seconds));
-    const h = Math.floor(seconds / 3600);
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = seconds % 60;
+    if (d) return d + "d " + h + "h " + m + "m";
     if (h) return h + "h " + m + "m";
     if (m) return m + "m " + s + "s";
     return s + "s";
@@ -211,10 +222,10 @@
     const ratePerMin = (accounts * 60) / cooldownSec;
     const etaSec = remaining * cooldownSec / accounts;
     el.textContent =
-      "left ≈ " + remaining +
-      " · " + ratePerMin.toFixed(1) + " px/min (" + accounts + " acc)" +
-      " · ETA ≈ " + formatDuration(etaSec) +
-      " · 1px/" + Math.round(cooldownSec) + "s";
+      "left \u2248 " + remaining +
+      " \u00b7 " + ratePerMin.toFixed(1) + " px/min (" + accounts + " acc)" +
+      " \u00b7 ETA \u2248 " + formatDuration(etaSec) +
+      " \u00b7 1px/" + Math.round(cooldownSec) + "s";
   }
 
   function populateColorSelect() {
@@ -242,7 +253,9 @@
 
   function readAllowReload() {
     const input = document.getElementById("bm-auto-allowreload");
-    return input ? Boolean(input.checked) : false;
+    if (input) return Boolean(input.checked);
+    const saved = getPersistedValue(BM_AUTO.allowReloadKey);
+    return saved === null ? true : saved === "1";
   }
 
   function rememberMap(candidate) {
@@ -526,6 +539,10 @@
           <input id="bm-auto-allowreload" type="checkbox" />
           Allow reload
         </label>
+        <label title="Checked by default: wait until your current maximum charges are full before painting. Uncheck to paint as soon as 1 charge is ready.">
+          <input id="bm-auto-waitfull" type="checkbox" />
+          Full charge
+        </label>
       </div>
       <div class="bm-auto-color-row" title="Which color to paint. Pick a specific color to paint it first; when it is done it continues with the remaining colors, fewest pixels first.">
         Color
@@ -574,9 +591,18 @@
     }
     const allowReloadInput = document.getElementById("bm-auto-allowreload");
     if (allowReloadInput) {
-      allowReloadInput.checked = getPersistedValue(BM_AUTO.allowReloadKey) === "1";
+      const savedAllowReload = getPersistedValue(BM_AUTO.allowReloadKey);
+      allowReloadInput.checked = savedAllowReload === null ? true : savedAllowReload === "1";
       allowReloadInput.addEventListener("change", () => {
         setPersistedValue(BM_AUTO.allowReloadKey, allowReloadInput.checked ? "1" : "0");
+      });
+    }
+    const waitFullInput = document.getElementById("bm-auto-waitfull");
+    if (waitFullInput) {
+      const savedWaitFull = getPersistedValue(BM_AUTO.waitFullChargesKey);
+      waitFullInput.checked = savedWaitFull === null ? true : savedWaitFull !== "0";
+      waitFullInput.addEventListener("change", () => {
+        setPersistedValue(BM_AUTO.waitFullChargesKey, waitFullInput.checked ? "1" : "0");
       });
     }
 
@@ -600,8 +626,8 @@
       updateStats();
     });
     updateStats();
-    // Resume only fires if a reload actually stored a pending target (i.e. the
-    // user enabled "Allow reload"); otherwise it is a no-op.
+    // Continue pending reload paints, or restart automatically if the painter
+    // was running before a normal page refresh.
     scheduleResumeAfterReload();
   }
 
@@ -995,6 +1021,7 @@
       if (cached) {
         const mod = await tryImportPaintModule(cached);
         if (mod) return mod;
+        await removePersistedValue(BM_AUTO.apiChunkKey);
       }
       const urls = collectWplaceChunkUrls();
       // 2) Chunks whose source text looks like the paint module.
@@ -1038,7 +1065,16 @@
 
   function findPaintApi(mod) {
     if (!mod) return null;
-    const hasPaint = (v) => v && typeof v.paint === "function" ? v : null;
+    const hasPaint = (v) => {
+      if (!v || typeof v.paint !== "function") return null;
+      try {
+        const source = Function.prototype.toString.call(v.paint);
+        if (!/(\/paint|getHeaders|colorIdx|tiles)/.test(source)) return null;
+      } catch (error) {
+        return null;
+      }
+      return v;
+    };
     if (hasPaint(mod.a)) return mod.a;
     for (const key of Object.keys(mod)) {
       let value;
@@ -1097,10 +1133,27 @@
     const charges = user && user.charges;
     if (!charges) return 0;
     const count = Number(charges.count || 0);
-    if (count >= 1) return 0;
+    const target = chargeTarget(user);
+    if (count >= target) return 0;
     const cooldown = Math.max(1000, Number(charges.cooldownMs || 30000));
-    const fraction = Math.max(0, Math.min(0.999, count - Math.floor(count)));
-    return Math.ceil((1 - fraction) * cooldown + BM_AUTO.waitPaddingMs);
+    return Math.ceil(Math.max(0, target - count) * cooldown + BM_AUTO.waitPaddingMs);
+  }
+
+  function chargeTarget(user) {
+    const charges = user && user.charges;
+    if (!charges) return 1;
+    const max = Math.floor(Number(charges.max || 0));
+    if (readWaitFullCharges() && Number.isFinite(max) && max > 1) return max;
+    return 1;
+  }
+
+  function chargeStatus(user, waitMs) {
+    const charges = user?.charges || {};
+    const target = chargeTarget(user);
+    const count = Number(charges.count || 0);
+    const max = Number(charges.max || target);
+    const label = readWaitFullCharges() && target > 1 ? "Charging to full" : "No charges";
+    return label + ". Waiting " + formatDuration(waitMs / 1000) + " (" + count.toFixed(2) + "/" + max + ").";
   }
 
   function userCanUseColor(user, colorId) {
@@ -1276,6 +1329,7 @@
 
   async function start() {
     if (state.running) return;
+    await setPersistedValue(BM_AUTO.activeKey, "1");
     await clearPendingTarget();
     state.directPaintDisabled = false;
     localStorage.removeItem(BM_AUTO.cursorKey);
@@ -1286,8 +1340,12 @@
       await run();
     } catch (error) {
       if ((error.message || "") !== "Stopped") {
+        const message = error.message || String(error);
+        if (/No enabled Blue Marble templates|contain no paintable pixels|template storage/i.test(message)) {
+          void setPersistedValue(BM_AUTO.activeKey, "0");
+        }
         state.stats.errors++;
-        setStatus(error.message || String(error));
+        setStatus(message);
       }
     } finally {
       state.running = false;
@@ -1299,6 +1357,7 @@
 
   function stop() {
     state.stop = true;
+    void setPersistedValue(BM_AUTO.activeKey, "0");
     void clearPendingTarget();
     setStatus("Stopping after the current step...");
   }
@@ -1433,14 +1492,29 @@
   function scheduleResumeAfterReload() {
     for (const delay of [250, 1500, 4000]) {
       setTimeout(() => {
-        if (!state.running) void resumeAfterReload();
+        if (state.running) return;
+        if (hasPendingResume()) void resumeAfterReload();
+        else if (shouldAutoStartAfterLoad()) void autoStartAfterLoad();
       }, delay);
     }
   }
 
+  function hasPendingResume() {
+    return getPersistedValue(BM_AUTO.resumeKey) === "1" || new URL(location.href).searchParams.get("bmAutoResume") === "1";
+  }
+
+  function shouldAutoStartAfterLoad() {
+    return getPersistedValue(BM_AUTO.activeKey) === "1";
+  }
+
+  async function autoStartAfterLoad() {
+    if (state.running || hasPendingResume() || !shouldAutoStartAfterLoad()) return;
+    setStatus("Auto-starting after page load...");
+    await start();
+  }
+
   async function resumeAfterReload() {
-    const shouldResume = getPersistedValue(BM_AUTO.resumeKey) === "1" || new URL(location.href).searchParams.get("bmAutoResume") === "1";
-    if (!shouldResume) return;
+    if (!hasPendingResume()) return;
     const target = restorePendingTarget();
     if (!target) {
       await clearPendingTarget();
@@ -1495,8 +1569,7 @@
       const user = await fetchJson("/me");
       const waitMs = chargesWaitMs(user);
       if (waitMs <= 0) return user;
-      const charges = user.charges || {};
-      setStatus("No charges. Waiting " + Math.ceil(waitMs / 1000) + "s (" + Number(charges.count || 0).toFixed(2) + "/" + charges.max + ").");
+      setStatus(chargeStatus(user, waitMs));
       await interruptibleSleep(waitMs);
     }
     throw new Error("Stopped");
@@ -1612,7 +1685,10 @@
 
   async function findPaintChunkUrl() {
     const cached = getPersistedValue(BM_AUTO.apiChunkKey);
-    if (cached) return cached;
+    if (cached) {
+      if (await looksLikeWplaceApiModule(cached)) return cached;
+      await removePersistedValue(BM_AUTO.apiChunkKey);
+    }
     for (const url of collectWplaceChunkUrls()) {
       if (await looksLikeWplaceApiModule(url)) {
         await setPersistedValue(BM_AUTO.apiChunkKey, url);
@@ -1639,10 +1715,11 @@
       const code =
         "(async()=>{try{" +
         "const mod=await import(" + JSON.stringify(chunkUrl) + ");" +
-        "let api=(mod.a&&typeof mod.a.paint==='function')?mod.a:null;" +
+        "const ok=(v)=>{try{if(!v||typeof v.paint!=='function')return false;const s=Function.prototype.toString.call(v.paint);return /(\\/paint|getHeaders|colorIdx|tiles)/.test(s);}catch(_){return false;}};" +
+        "let api=ok(mod.a)?mod.a:null;" +
         "if(!api){for(const k in mod){try{const v=mod[k];" +
-        "if(v&&typeof v.paint==='function'){api=v;break;}" +
-        "if(v&&typeof v==='object'){for(const j in v){try{if(v[j]&&typeof v[j].paint==='function'){api=v[j];break;}}catch(_){}}if(api)break;}" +
+        "if(ok(v)){api=v;break;}" +
+        "if(v&&typeof v==='object'){for(const j in v){try{if(ok(v[j])){api=v[j];break;}}catch(_){}}if(api)break;}" +
         "}catch(_){}}}" +
         "window.__bmWplaceMod=mod;window.__bmWplaceApi=api;" +
         "try{if(mod.j&&mod.j.map)window.__bmWplaceMap=mod.j.map;}catch(_){}" +
@@ -1743,9 +1820,8 @@
       state.cooldownMs = Math.max(1000, Number((user && user.charges && user.charges.cooldownMs) || state.cooldownMs || 30000));
       const waitMs = chargesWaitMs(user);
       if (waitMs > 0) {
-        const charges = user.charges || {};
         updateEta();
-        setStatus("No charges. Waiting " + Math.ceil(waitMs / 1000) + "s (" + Number(charges.count || 0).toFixed(2) + "/" + charges.max + ").");
+        setStatus(chargeStatus(user, waitMs));
         await interruptibleSleep(waitMs);
         continue;
       }
@@ -1760,6 +1836,7 @@
       const batch = await pickColorBatch(user, limit);
       if (!batch.length) {
         setStatus("Done: every available template pixel looks correct.");
+        await setPersistedValue(BM_AUTO.activeKey, "0");
         updateEta();
         break;
       }
