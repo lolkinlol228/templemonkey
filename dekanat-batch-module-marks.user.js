@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dekanat batch module marks
 // @namespace    local.dekanat.batch-module-marks
-// @version      1.4
+// @version      1.7
 // @description  Select groups, semesters, subjects, then fill 1M/2M component marks.
 // @match        *://*/*
 // @run-at       document-idle
@@ -17,28 +17,30 @@
 
   const MODULES = [
     {
+      key: 'm1',
       label: '1М',
       test: '1М Тест',
       fields: [
-        { title: '1М Посещаемость', min: 3, max: 5 },
-        { title: '1М Активность', min: 6, max: 10 },
-        { title: '1М СРС', min: 11, max: 15 }
+        { title: '1М Посещаемость', fallbackMax: 2 },
+        { title: '1М Активность', fallbackMax: 8 },
+        { title: '1М СРС', fallbackMax: 4 }
       ]
     },
     {
+      key: 'm2',
       label: '2М',
       test: '2М Тест',
       fields: [
-        { title: '2М Посещаемость', min: 3, max: 5 },
-        { title: '2М Активность', min: 6, max: 10 },
-        { title: '2М СРС', min: 11, max: 15 }
+        { title: '2М Посещаемость', fallbackMax: 2 },
+        { title: '2М Активность', fallbackMax: 8 },
+        { title: '2М СРС', fallbackMax: 4 }
       ]
     }
   ];
 
   const state = loadState();
   const runState = { running: false, stop: false };
-  let panel, groupsEl, semestersEl, subjectsEl, logEl, statEl;
+  let panel, groupsEl, semestersEl, subjectsEl, modulesEl, logEl, statEl;
 
   function loadState(){
     try{
@@ -49,10 +51,11 @@
         subjectsByGroup: parsed.subjectsByGroup && typeof parsed.subjectsByGroup === 'object' ? parsed.subjectsByGroup : {},
         selectedSemesters: Array.isArray(parsed.selectedSemesters) ? parsed.selectedSemesters : [],
         selectedSubjectKeys: Array.isArray(parsed.selectedSubjectKeys) ? parsed.selectedSubjectKeys : [],
+        selectedModuleKeys: Array.isArray(parsed.selectedModuleKeys) && parsed.selectedModuleKeys.length ? parsed.selectedModuleKeys : MODULES.map(module => module.key),
         panelPosition: parsed.panelPosition && typeof parsed.panelPosition === 'object' ? parsed.panelPosition : null
       };
     }catch(e){
-      return { groups: [], selectedGroupIds: [], subjectsByGroup: {}, selectedSemesters: [], selectedSubjectKeys: [], panelPosition: null };
+      return { groups: [], selectedGroupIds: [], subjectsByGroup: {}, selectedSemesters: [], selectedSubjectKeys: [], selectedModuleKeys: MODULES.map(module => module.key), panelPosition: null };
     }
   }
 
@@ -124,6 +127,38 @@
   function selectedGroups(){
     const selected = new Set(state.selectedGroupIds.map(String));
     return state.groups.filter(group => selected.has(String(group.groupId)));
+  }
+
+  function selectedModuleKeySet(){
+    const keys = state.selectedModuleKeys && state.selectedModuleKeys.length
+      ? state.selectedModuleKeys
+      : MODULES.map(module => module.key);
+    return new Set(keys.map(String));
+  }
+
+  function updateModuleSelectionFromDom(){
+    if(!modulesEl) return;
+    state.selectedModuleKeys = [...modulesEl.querySelectorAll('input[data-module-key]:checked')]
+      .map(input => input.dataset.moduleKey);
+    if(!state.selectedModuleKeys.length){
+      state.selectedModuleKeys = MODULES.map(module => module.key);
+    }
+    saveState();
+    renderModules();
+    updateStat();
+  }
+
+  function renderModules(){
+    if(!modulesEl) return;
+    const selected = selectedModuleKeySet();
+    modulesEl.innerHTML = MODULES.map(module => `
+      <label style="display:inline-flex;align-items:center;gap:4px;margin-right:14px">
+        <input type="checkbox" data-module-key="${escapeHtml(module.key)}" ${selected.has(module.key) ? 'checked' : ''}>
+        ${escapeHtml(module.label)}
+      </label>`).join('');
+    modulesEl.querySelectorAll('input[data-module-key]').forEach(input => {
+      input.onchange = updateModuleSelectionFromDom;
+    });
   }
 
   function updateGroupSelectionFromDom(){
@@ -606,12 +641,54 @@
     return Math.floor(Math.random() * (max - min + 1)) + min;
   }
 
-  function buildModels(rows, dopuskSet, overwrite){
+  function randomStep(min, max, step){
+    const scale = Math.round(1 / step);
+    const from = Math.ceil(min * scale);
+    const to = Math.floor(max * scale);
+    return Math.round(randomInt(from, to) / scale * scale) / scale;
+  }
+
+  function randomMark(range){
+    return range.step === 1
+      ? randomInt(range.min, range.max)
+      : randomStep(range.min, range.max, range.step);
+  }
+
+  function markVarsByName(markVars){
+    const byName = new Map();
+    (Array.isArray(markVars) ? markVars : []).forEach(item => {
+      if(!item || !item.NamePole) return;
+      byName.set(norm(item.NamePole), item);
+    });
+    return byName;
+  }
+
+  function autoRange(maxValue){
+    const max = Math.floor(num(maxValue));
+    if(max <= 0) return null;
+    if(max === 4) return { min: 2.6, max: 3.4, step: 0.1 };
+    if(max === 2) return { min: 1.6, max: 2, step: 0.1 };
+    return {
+      min: Math.max(1, Math.min(max, Math.floor(max * 0.7))),
+      max,
+      step: 1
+    };
+  }
+
+  function fieldRange(field, fieldKey, markVarsByNameMap){
+    const markVar = markVarsByNameMap.get(norm(fieldKey)) || markVarsByNameMap.get(norm(field.title));
+    return autoRange(markVar && markVar.max) || autoRange(field.fallbackMax);
+  }
+
+  function buildModels(rows, dopuskSet, overwrite, markVars, selectedModuleKeys){
     const modelsByRow = [];
+    const markVarsByNameMap = markVarsByName(markVars);
+    const selectedModules = new Set(selectedModuleKeys);
 
     rows.forEach(row => {
       const rowModels = [];
       MODULES.forEach(module => {
+        if(!selectedModules.has(module.key)) return;
         const testKey = findKey(row, module.test);
         if(!testKey || num(row[testKey]) === 0) return;
 
@@ -619,11 +696,13 @@
           const fieldKey = findKey(row, field.title);
           if(!fieldKey) return;
           if(!overwrite && num(row[fieldKey]) !== 0) return;
+          const range = fieldRange(field, fieldKey, markVarsByNameMap);
+          if(!range) return;
           rowModels.push({
             JurnalID: row.JurnalID,
             PoleName: fieldKey,
             StudentID: row.StudentID,
-            StudentOtcenka: randomInt(field.min, field.max),
+            StudentOtcenka: randomMark(range),
             hasDopusk: dopuskSet.has(Number(row.StudentID))
           });
         });
@@ -634,7 +713,7 @@
     return modelsByRow;
   }
 
-  async function fillSubject(subject, overwrite){
+  async function fillSubject(subject, overwrite, selectedModuleKeys){
     const p = subjectParams(subject);
     const journalUrl = makeUrl('/Dekanat/jurnalprocedure', {
       idDis: p.idDis,
@@ -648,6 +727,19 @@
       idPotok: p.idPotok,
       idLoad: p.idLoad
     });
+    const markVarsUrl = makeUrl('/Dekanat/GetMarkVars', {
+      DisciplineID: p.idDis,
+      ExaminationID: p.idExam,
+      Kredit: p.kredit,
+      YearID: p.idYear,
+      SemesterID: p.idSem,
+      VedomostID: p.idVed,
+      GroupID: p.idGroup,
+      Rules: p.rules,
+      EducPlanID: p.idPlan,
+      idPotok: p.idPotok,
+      idLoad: p.idLoad
+    });
     const dopuskUrl = makeUrl('/Dekanat/GroupSmetas', {
       idYear: p.idYear,
       idSemestr: p.idSem,
@@ -658,12 +750,14 @@
 
     const rows = await fetchJson(journalUrl);
     if(!Array.isArray(rows)) throw new Error('jurnalprocedure вернул не массив');
+    const markVars = await fetchJson(markVarsUrl);
+    if(!Array.isArray(markVars)) throw new Error('GetMarkVars вернул не массив');
     const dopusks = await fetchJson(dopuskUrl).catch(() => []);
     const dopuskSet = new Set((Array.isArray(dopusks) ? dopusks : [])
       .filter(item => item && item.dopusk)
       .map(item => Number(item.StudentID)));
 
-    const modelsByRow = buildModels(rows, dopuskSet, overwrite);
+    const modelsByRow = buildModels(rows, dopuskSet, overwrite, markVars, selectedModuleKeys);
     let cells = 0;
     for(const rowModels of modelsByRow){
       if(runState.stop) break;
@@ -700,6 +794,9 @@
     uiBusy(true);
 
     const overwrite = panel.querySelector('#dbmf-overwrite').checked;
+    const selectedModuleKeys = state.selectedModuleKeys && state.selectedModuleKeys.length
+      ? state.selectedModuleKeys
+      : MODULES.map(module => module.key);
     let done = 0;
     let cells = 0;
     try{
@@ -708,7 +805,7 @@
         setStat('Обработка ' + (done + 1) + '/' + subjects.length);
         log(subject.groupName + ' | ' + subject.name + '...');
         try{
-          const result = await fillSubject(subject, overwrite);
+          const result = await fillSubject(subject, overwrite, selectedModuleKeys);
           cells += result.cells;
           done++;
           log('OK: строк ' + result.rows + ', изменено строк ' + result.changedRows + ', ячеек ' + result.cells, '#0a0');
@@ -779,12 +876,18 @@
 
   function updateStat(){
     const sem = state.selectedSemesters.length ? state.selectedSemesters.join(',') : '-';
+    const selectedModules = selectedModuleKeySet();
+    const moduleLabels = MODULES
+      .filter(module => selectedModules.has(module.key))
+      .map(module => module.label)
+      .join(', ');
     const chosenSubjectKeys = new Set(state.selectedSubjectKeys.map(String));
     const visibleChosen = aggregateVisibleSubjects().filter(item => chosenSubjectKeys.has(item.key)).length;
     setStat(
       'Групп: ' + state.groups.length +
       ', выбрано групп: ' + selectedGroups().length +
       ', семестр: ' + sem +
+      ', модули: ' + (moduleLabels || '-') +
       ', предметов выбрано: ' + visibleChosen +
       ', к обработке: ' + allSelectedSubjects().length
     );
@@ -855,7 +958,7 @@
         const el = panel && panel.querySelector('#' + id);
         if(el) el.disabled = busy;
       });
-    ['dbmf-groups','dbmf-semesters','dbmf-subjects'].forEach(id => {
+    ['dbmf-groups','dbmf-semesters','dbmf-subjects','dbmf-modules'].forEach(id => {
       const el = panel && panel.querySelector('#' + id);
       if(el) el.querySelectorAll('input').forEach(input => { input.disabled = busy; });
     });
@@ -975,6 +1078,8 @@
       <label style="display:block;margin-bottom:8px">
         <input id="dbmf-overwrite" type="checkbox" checked> перезаписывать уже заполненные ячейки
       </label>
+      <div style="font-weight:bold;margin:8px 0 4px">Модули для заполнения</div>
+      <div id="dbmf-modules" style="background:#f7f7f7;border:1px solid #ddd;border-radius:5px;padding:8px;margin-bottom:8px"></div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
         <button id="dbmf-start" style="padding:8px;background:#0a7;color:#fff;border:0;border-radius:5px;cursor:pointer">Старт</button>
         <button id="dbmf-stop" style="padding:8px;background:#c33;color:#fff;border:0;border-radius:5px;cursor:pointer" disabled>Стоп</button>
@@ -1005,6 +1110,7 @@
     groupsEl = panel.querySelector('#dbmf-groups');
     semestersEl = panel.querySelector('#dbmf-semesters');
     subjectsEl = panel.querySelector('#dbmf-subjects');
+    modulesEl = panel.querySelector('#dbmf-modules');
     logEl = panel.querySelector('#dbmf-log');
     statEl = panel.querySelector('#dbmf-stat');
 
@@ -1025,6 +1131,7 @@
 
     applyPanelPosition();
     makePanelDraggable();
+    renderModules();
     renderGroups();
     renderSubjects();
   }
